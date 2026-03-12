@@ -21,7 +21,7 @@ from embeds import Embeds
 
 log = logging.getLogger("musubi.help")
 
-SUPPORT_SERVER = "https://discord.gg/GF9xN7CHfz"
+SUPPORT_SERVER = "https://discord.gg/ZMEq3QbSCY"
 MADE_BY        = "†spector"
 BRAND_COLOR    = 0xC084FC
 
@@ -74,10 +74,12 @@ def _make_main_embed(bot_avatar: str | None = None) -> discord.Embed:
     if bot_avatar:
         embed.set_thumbnail(url=bot_avatar)
     embed.description = (
+        "> `⚙️` *New here? Start with these two commands:*\n"
+        "```\n@Musubi setup   — register your server and set a booth channel\n"
+        "@Musubi call    — dial into the network and connect with another server\n```\n"
         "> *Use `/help cmds` to see all available commands*\n"
         "> *Use `/help <command>` for details on a specific command*\n"
-        "```\nExample: /help call  •  /help setup\n```\n"
-        "> *Join our support server for help, feedback, and updates:*\n"
+        "> *Questions? Join our support server:*\n"
         f"> {SUPPORT_SERVER}"
     )
     embed.set_footer(text=f"❣️ Made by {MADE_BY}")
