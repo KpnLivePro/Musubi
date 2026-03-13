@@ -1,5 +1,5 @@
 """
-Project MUSUBI — datamanager.py v3
+Project MUSUBI — datamanager.py v4
 Guild-to-guild relay. Supabase REST via httpx.
 
 Speed 1: in-memory (webhook cache only — sessions live in DB)
@@ -10,6 +10,13 @@ Schema notes:
 - Guilds.level column removed — XP is wiped monthly via Supabase cron
 - Guilds.xp persists per cycle and is saved for leaderboard snapshot before wipe
 - Sessions: single row per call (caller + target on same row)
+
+Memory notes (v4):
+- Single persistent httpx.AsyncClient shared across all requests instead of
+  spawning a new client per call. Each new client allocates its own SSL context
+  and connection pool — at high message rates this caused significant GC pressure
+  and RAM spikes. The shared client reuses connections and keeps one SSL context.
+- Call close() on shutdown to cleanly release the client.
 """
 
 from __future__ import annotations
@@ -34,7 +41,7 @@ XP_PREMIUM_MULTIPLIER = 2   # guild premium doubles XP
 _TOMBSTONE_MAX = 2_000
 
 
-def _headers() -> dict:
+def _base_headers() -> dict:
     key = os.environ.get("SUPABASE_KEY", "")
     return {
         "apikey":        key,
@@ -58,10 +65,9 @@ class DataManager:
         # Speed 2
         self.guilds: dict[str, dict] = {}   # guild_id (str) → guild data
         self.users:  dict[str, dict] = {}   # user_id  (str) → user data
-        self.sudo:            set[str] = set()
-        self.banned_users:    set[str] = set()
-        self.blocklist:       set[str] = set()
-        self.guild_blocklist: dict[str, set[str]] = {}  # guild_id → set of phrases
+        self.sudo:         set[str] = set()
+        self.banned_users: set[str] = set()
+        self.blocklist:    set[str] = set()
 
         # Fast-path tombstone — ended session IDs so bridge stops relay immediately
         # Pruned when it exceeds _TOMBSTONE_MAX to prevent unbounded growth
@@ -71,40 +77,46 @@ class DataManager:
         self.XP_PER_MESSAGE        = XP_PER_MESSAGE
         self.XP_PREMIUM_MULTIPLIER = XP_PREMIUM_MULTIPLIER
 
+        # Single persistent HTTP client — reuses SSL context and connection pool.
+        # Created here so it's available before load_all() is called.
+        self._http = httpx.AsyncClient(
+            timeout=10.0,
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+        )
+
+    async def close(self) -> None:
+        """Call on bot shutdown to cleanly close the HTTP client."""
+        await self._http.aclose()
+
     # ── HTTP helpers ────────────────────────────────────────────────────
 
     async def _get(self, table: str, params: dict) -> list[dict]:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(_url(table), params=params, headers=_headers())
-            r.raise_for_status()
-            return r.json()
+        r = await self._http.get(_url(table), params=params, headers=_base_headers())
+        r.raise_for_status()
+        return r.json()
 
     async def _upsert(self, table: str, payload: dict) -> list[dict]:
-        headers = {**_headers(), "Prefer": "resolution=merge-duplicates,return=representation"}
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.post(_url(table), json=payload, headers=headers)
-            r.raise_for_status()
-            return r.json()
+        headers = {**_base_headers(), "Prefer": "resolution=merge-duplicates,return=representation"}
+        r = await self._http.post(_url(table), json=payload, headers=headers)
+        r.raise_for_status()
+        return r.json()
 
     async def _insert(self, table: str, payload: dict) -> dict:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.post(_url(table), json=payload, headers=_headers())
-            if not r.is_success:
-                log.error("_insert %s failed — %s: %s", table, r.status_code, r.text)
-            r.raise_for_status()
-            return r.json()[0]
+        r = await self._http.post(_url(table), json=payload, headers=_base_headers())
+        if not r.is_success:
+            log.error("_insert %s failed — %s: %s", table, r.status_code, r.text)
+        r.raise_for_status()
+        return r.json()[0]
 
     async def _patch(self, table: str, params: dict, payload: dict) -> list[dict]:
-        headers = {**_headers(), "Prefer": "return=representation"}
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.patch(_url(table), params=params, json=payload, headers=headers)
-            r.raise_for_status()
-            return r.json()
+        headers = {**_base_headers(), "Prefer": "return=representation"}
+        r = await self._http.patch(_url(table), params=params, json=payload, headers=headers)
+        r.raise_for_status()
+        return r.json()
 
     async def _delete(self, table: str, params: dict) -> None:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.delete(_url(table), params=params, headers=_headers())
-            r.raise_for_status()
+        r = await self._http.delete(_url(table), params=params, headers=_base_headers())
+        r.raise_for_status()
 
     # ── Startup ─────────────────────────────────────────────────────────
 
@@ -115,13 +127,12 @@ class DataManager:
             self._load_sudo(),
             self._load_banned_users(),
             self._load_blocklist(),
-            self._load_guild_blocklist(),
         )
         await self._clear_stale_sessions()
         log.info(
-            "Cache warmed — guilds:%d users:%d sudo:%d banned:%d blocklist:%d guild_blocklist_guilds:%d",
+            "Cache warmed — guilds:%d users:%d sudo:%d banned:%d blocklist:%d",
             len(self.guilds), len(self.users), len(self.sudo),
-            len(self.banned_users), len(self.blocklist), len(self.guild_blocklist),
+            len(self.banned_users), len(self.blocklist),
         )
 
     async def _clear_stale_sessions(self) -> None:
@@ -138,6 +149,7 @@ class DataManager:
             log.info("Startup cleanup — ended %d stale session(s).", len(rows))
         except Exception as e:
             log.error("_clear_stale_sessions failed: %s", e)
+
     async def _load_guilds(self) -> None:
         try:
             rows = await self._get("Guilds", {"select": "*"})
@@ -148,8 +160,6 @@ class DataManager:
                     "prefix":        r.get("prefix"),
                     "xp":            r.get("xp") or 0,
                     "is_banned":     r.get("is_banned") or False,
-                    "invite_url":    r.get("invite_url"),
-                    "invite_quota":  r.get("invite_quota") or 0,
                 }
                 for r in rows
             }
@@ -193,16 +203,6 @@ class DataManager:
         except Exception as e:
             log.error("Failed to load blocklist: %s", e)
 
-    async def _load_guild_blocklist(self) -> None:
-        try:
-            rows = await self._get("GuildBlocklist", {"select": "guild_id,phrase"})
-            self.guild_blocklist = {}
-            for r in rows:
-                gid = r["guild_id"]
-                self.guild_blocklist.setdefault(gid, set()).add(r["phrase"])
-        except Exception as e:
-            log.error("Failed to load guild blocklist: %s", e)
-
     # ── Guilds ──────────────────────────────────────────────────────────
 
     def get_guild(self, guild_id: int | str) -> Optional[dict]:
@@ -225,8 +225,6 @@ class DataManager:
             "prefix":        None,
             "xp":            0,
             "is_banned":     False,
-            "invite_url":    None,
-            "invite_quota":  0,
         }
         try:
             await self._upsert("Guilds", {
@@ -265,6 +263,31 @@ class DataManager:
             await self._patch("Guilds", {"guild_id": f"eq.{gid}"}, {"is_banned": banned})
         except Exception as e:
             log.error("ban_guild failed: %s", e)
+
+    async def add_xp(self, guild_id: int | str, amount: int = XP_PER_MESSAGE, premium_guild: bool = False) -> dict:
+        """
+        Add XP to a guild. Returns dict with updated xp value.
+        Level is not tracked — XP is wiped monthly via Supabase cron.
+        """
+        gid = str(guild_id)
+        g   = self.guilds.get(gid)
+        if not g:
+            return {}
+
+        g["xp"] = g["xp"] or 0
+        actual  = amount * XP_PREMIUM_MULTIPLIER if premium_guild else amount
+        g["xp"] += actual
+
+        try:
+            await self._patch(
+                "Guilds",
+                {"guild_id": f"eq.{gid}"},
+                {"xp": g["xp"]},
+            )
+        except Exception as e:
+            log.error("add_xp failed: %s", e)
+
+        return {"xp": g["xp"]}
 
     # ── Users ───────────────────────────────────────────────────────────
 
@@ -362,137 +385,6 @@ class DataManager:
         except Exception as e:
             log.error("blocklist_clear failed: %s", e)
 
-    # ── Guild Blocklist ──────────────────────────────────────────────────
-
-    def get_guild_blocklist(self, guild_id: int | str) -> set[str]:
-        return self.guild_blocklist.get(str(guild_id), set())
-
-    async def guild_blocklist_add(self, guild_id: int | str, phrase: str) -> None:
-        gid = str(guild_id)
-        self.guild_blocklist.setdefault(gid, set()).add(phrase)
-        try:
-            await self._upsert("GuildBlocklist", {"guild_id": gid, "phrase": phrase})
-        except Exception as e:
-            log.error("guild_blocklist_add failed: %s", e)
-
-    async def guild_blocklist_remove(self, guild_id: int | str, phrase: str) -> None:
-        gid = str(guild_id)
-        if gid in self.guild_blocklist:
-            self.guild_blocklist[gid].discard(phrase)
-        try:
-            await self._delete("GuildBlocklist", {"guild_id": f"eq.{gid}", "phrase": f"eq.{phrase}"})
-        except Exception as e:
-            log.error("guild_blocklist_remove failed: %s", e)
-
-    async def guild_blocklist_clear(self, guild_id: int | str) -> None:
-        gid = str(guild_id)
-        self.guild_blocklist.pop(gid, None)
-        try:
-            await self._delete("GuildBlocklist", {"guild_id": f"eq.{gid}"})
-        except Exception as e:
-            log.error("guild_blocklist_clear failed: %s", e)
-
-    # ── Invites ─────────────────────────────────────────────────────────
-
-    DAILY_QUOTA_FREE    = 10
-    DAILY_QUOTA_PREMIUM = 30
-    XP_COSTS: dict[int, int] = {5: 150, 10: 200, 20: 350}  # invites → xp cost
-
-    async def set_guild_invite(self, guild_id: int | str, invite_url: str) -> None:
-        """Store the permanent booth-channel invite URL for a guild."""
-        gid = str(guild_id)
-        if gid in self.guilds:
-            self.guilds[gid]["invite_url"] = invite_url
-        try:
-            await self._patch("Guilds", {"guild_id": f"eq.{gid}"}, {"invite_url": invite_url})
-        except Exception as e:
-            log.error("set_guild_invite failed: %s", e)
-
-    async def add_invite_quota(self, guild_id: int | str, amount: int, xp_cost: int) -> bool:
-        """
-        Spend guild XP to buy extra invite quota.
-        Subtracts xp_cost from guild XP and adds amount to invite_quota.
-        Returns False if guild doesn't have enough XP.
-        """
-        gid = str(guild_id)
-        g   = self.guilds.get(gid)
-        if not g:
-            return False
-        current_xp = g.get("xp") or 0
-        if current_xp < xp_cost:
-            return False
-        g["xp"]           = current_xp - xp_cost
-        g["invite_quota"] = (g.get("invite_quota") or 0) + amount
-        try:
-            await self._patch("Guilds", {"guild_id": f"eq.{gid}"}, {
-                "xp":           g["xp"],
-                "invite_quota": g["invite_quota"],
-            })
-            return True
-        except Exception as e:
-            log.error("add_invite_quota failed: %s", e)
-            return False
-
-    async def get_invite_usage(self, guild_id: int | str) -> dict:
-        """
-        Return today's invite usage row for a guild.
-        Creates the row if it doesn't exist yet.
-        Rolls resets_at forward if the reset window has passed.
-        """
-        from datetime import timezone
-        gid = str(guild_id)
-        now = datetime.now(timezone.utc)
-        try:
-            rows = await self._get("InviteUsage", {"select": "*", "guild_id": f"eq.{gid}"})
-            if not rows:
-                # First time — create the row
-                midnight = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-                row = await self._insert("InviteUsage", {
-                    "guild_id":  gid,
-                    "used":      0,
-                    "resets_at": midnight.isoformat(),
-                })
-                return row
-            row = rows[0]
-            # Check if the reset window has passed
-            resets_at = datetime.fromisoformat(row["resets_at"])
-            if now >= resets_at:
-                midnight  = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
-                updated   = await self._patch("InviteUsage", {"guild_id": f"eq.{gid}"}, {
-                    "used":      0,
-                    "resets_at": midnight.isoformat(),
-                })
-                return updated[0] if updated else row
-            return row
-        except Exception as e:
-            log.error("get_invite_usage failed: %s", e)
-            return {"guild_id": gid, "used": 0, "resets_at": now.isoformat()}
-
-    async def increment_invite_usage(self, guild_id: int | str) -> None:
-        """Increment the daily invite use counter for a guild by 1."""
-        gid = str(guild_id)
-        try:
-            row = await self.get_invite_usage(gid)
-            await self._patch("InviteUsage", {"guild_id": f"eq.{gid}"}, {
-                "used": (row.get("used") or 0) + 1,
-            })
-        except Exception as e:
-            log.error("increment_invite_usage failed: %s", e)
-
-    async def get_invite_allowance(self, guild_id: int | str) -> tuple[int, int, int]:
-        """
-        Return (used_today, total_allowed, quota_bank) for a guild.
-        total_allowed = daily base (premium or free) + quota_bank purchases.
-        """
-        gid      = str(guild_id)
-        g        = self.guilds.get(gid)
-        is_prem  = await self.is_premium_guild(gid)
-        base     = self.DAILY_QUOTA_PREMIUM if is_prem else self.DAILY_QUOTA_FREE
-        bank     = (g.get("invite_quota") or 0) if g else 0
-        usage    = await self.get_invite_usage(gid)
-        used     = usage.get("used") or 0
-        return used, base + bank, bank
-
     # ── Sessions ────────────────────────────────────────────────────────
 
     async def create_session(
@@ -585,15 +477,15 @@ class DataManager:
         Get the active session for a guild — the guild can be on either side
         of the call (caller_guild or target_guild on the single shared row).
 
-        PostgREST or() is passed as a top-level query param alongside the
-        status filter. The or() checks both sides of the single session row.
+        PostgREST requires the `or` filter to be passed as a query parameter
+        with the column filters embedded in the value string. The status filter
+        is applied inside the or() so it doesn't conflict.
         """
         gid = str(guild_id)
         try:
             rows = await self._get("Sessions", {
                 "select": "*",
-                "status": "eq.active",
-                "or":     f"(caller_guild.eq.{gid},target_guild.eq.{gid})",
+                "and":    f"(status.eq.active,or(caller_guild.eq.{gid},target_guild.eq.{gid}))",
                 "limit":  "1",
             })
             if not rows:
@@ -646,6 +538,16 @@ class DataManager:
         except Exception as e:
             log.error("end_session failed: %s", e)
 
+    async def bump_activity(self, session_id: str) -> None:
+        try:
+            await self._patch(
+                "Sessions",
+                {"id": f"eq.{session_id}"},
+                {"last_activity": datetime.now(timezone.utc).isoformat()},
+            )
+        except Exception as e:
+            log.error("bump_activity failed: %s", e)
+
     async def add_xp_bulk(self, guild_id: int | str, amount: int) -> None:
         """
         Write a pre-accumulated XP amount directly to DB.
@@ -664,17 +566,6 @@ class DataManager:
             )
         except Exception as e:
             log.error("add_xp_bulk failed for %s: %s", gid, e)
-
-    async def bump_activity(self, session_id: str) -> None:
-        """Update last_activity on a session row to prevent idle timeout."""
-        try:
-            await self._patch(
-                "Sessions",
-                {"id": f"eq.{session_id}"},
-                {"last_activity": datetime.now(timezone.utc).isoformat()},
-            )
-        except Exception as e:
-            log.error("bump_activity failed: %s", e)
 
     async def get_idle_sessions(self, idle_minutes: int = 30) -> list[dict]:
         """Return active sessions with no activity for idle_minutes."""

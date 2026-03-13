@@ -248,7 +248,7 @@ class Phone(commands.Cog):
 
     # ── /call ────────────────────────────────────────────────────────────
 
-    @commands.hybrid_command(name="call", aliases=["c", "dial"], description="Search for another server to connect with.")
+    @commands.hybrid_command(name="call", aliases=["c"], description="Search for another server to connect with.")
     @commands.cooldown(rate=1, per=15, type=commands.BucketType.guild)
     async def call(self, ctx: commands.Context[MusubiBot]) -> None:
         """Place a call and search for an available server to connect with."""
@@ -363,7 +363,7 @@ class Phone(commands.Cog):
 
     # ── /hangup ──────────────────────────────────────────────────────────
 
-    @commands.hybrid_command(name="hangup", aliases=["h", "hup", "end"], description="End the current call or cancel a search.")
+    @commands.hybrid_command(name="hangup", aliases=["h"], description="End the current call or cancel a search.")
     async def hangup(self, ctx: commands.Context[MusubiBot]) -> None:
         """End your current call or cancel an active search."""
         assert ctx.guild is not None
@@ -417,7 +417,7 @@ class Phone(commands.Cog):
 
     # ── /anonymous ───────────────────────────────────────────────────────
 
-    @commands.hybrid_command(name="anonymous", aliases=["a", "anon"], description="Toggle anonymous mode for your messages during calls.")
+    @commands.hybrid_command(name="anonymous", aliases=["a"], description="Toggle anonymous mode for your messages during calls.")
     async def anonymous(self, ctx: commands.Context[MusubiBot]) -> None:
         """
         Toggle anonymous mode. When on, your name and avatar are hidden
@@ -436,7 +436,7 @@ class Phone(commands.Cog):
 
     # ── /friendme ────────────────────────────────────────────────────────
 
-    @commands.hybrid_command(name="friendme", aliases=["fm", "friend"], description="Send your Discord tag to the other server during a call.")
+    @commands.hybrid_command(name="friendme", aliases=["f"], description="Send your Discord tag to the other server during a call.")
     async def friendme(self, ctx: commands.Context[MusubiBot]) -> None:
         """
         Share your Discord tag with the other server so they can add you.

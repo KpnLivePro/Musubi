@@ -49,8 +49,6 @@ INITIAL_EXTENSIONS = [
     "cogs.help",
     "cogs.filter",
     "cogs.leaderboard",
-    "cogs.webcon",
-    "cogs.invite",
 ]
 
 
@@ -63,14 +61,16 @@ class Musubi(MusubiBot):
     ) -> None:
         intents = discord.Intents.default()
         intents.message_content = True
-        intents.members = True
+        # members intent intentionally omitted — never used in this codebase,
+        # but enabling it causes discord.py to cache every member of every guild
+        # the bot is in, which is the single largest RAM consumer on a busy network.
 
         super().__init__(
             command_prefix=resolve_prefix,
             help_command=None,
             intents=intents,
             owner_id=OWNER_ID,
-            max_messages=1_000,
+            max_messages=100,   # was 1_000 — bridge only needs delete relay, 100 is plenty
             chunk_guilds_at_startup=False,
         )
 
@@ -199,6 +199,7 @@ class Musubi(MusubiBot):
 
     async def close(self) -> None:
         log.info("Shutting down.")
+        await self.data.close()
         await super().close()
 
 

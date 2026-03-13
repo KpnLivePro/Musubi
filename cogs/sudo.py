@@ -663,6 +663,101 @@ class Sudo(commands.Cog):
         log.info("Reload all by %d", ctx.author.id)
         await ctx.send(embed=Embeds.reload_all(lines), ephemeral=True)
 
+    # ── /sudo filter ──────────────────────────────────────────────────────
+
+    @sudo.group(name="filter", description="Manage the global network-wide message blocklist.")
+    @is_sudo()
+    async def filter_group(self, ctx: commands.Context[commands.Bot]) -> None:
+        if ctx.invoked_subcommand is None:
+            await ctx.send(
+                embed=Embeds.info("Available subcommands: `add`, `remove`, `list`, `clear`"),
+                ephemeral=True,
+            )
+
+    @filter_group.command(name="add", description="Add phrases to the global blocklist.")
+    @is_sudo()
+    async def filter_add(
+        self,
+        ctx: commands.Context[commands.Bot],
+        *,
+        phrase: str,
+    ) -> None:
+        """
+        Add one or more comma-separated words or phrases to the global network blocklist.
+
+        Parameters
+        ----------
+        phrase: str
+            Comma-separated words or phrases to block (e.g. badword, slur, spam phrase).
+        """
+        entries = [p.strip().lower() for p in phrase.split(",") if p.strip()]
+        if not entries:
+            await ctx.send(embed=Embeds.error("No valid phrases provided."), ephemeral=True)
+            return
+        for entry in entries:
+            await self.data.blocklist_add(entry)
+        added = ", ".join(f"`{e}`" for e in entries)
+        log.info("Filter:add — %s by %d", entries, ctx.author.id)
+        await ctx.send(
+            embed=Embeds.action(f"Added to global blocklist: {added}", ctx.author),
+            ephemeral=True,
+        )
+
+    @filter_group.command(name="remove", description="Remove a phrase from the global blocklist.")
+    @is_sudo()
+    async def filter_remove(
+        self,
+        ctx: commands.Context[commands.Bot],
+        *,
+        phrase: str,
+    ) -> None:
+        """
+        Remove a word or phrase from the global network blocklist.
+
+        Parameters
+        ----------
+        phrase: str
+            The exact word or phrase to remove.
+        """
+        phrase = phrase.lower().strip()
+        if phrase not in self.data.blocklist:
+            await ctx.send(embed=Embeds.error(f"`{phrase}` is not in the global blocklist."), ephemeral=True)
+            return
+        await self.data.blocklist_remove(phrase)
+        log.info("Filter:remove — '%s' by %d", phrase, ctx.author.id)
+        await ctx.send(
+            embed=Embeds.action(f"`{phrase}` removed from the global blocklist.", ctx.author),
+            ephemeral=True,
+        )
+
+    @filter_group.command(name="list", description="List all entries in the global blocklist.")
+    @is_sudo()
+    async def filter_list(self, ctx: commands.Context[commands.Bot]) -> None:
+        """Show every phrase currently on the global network-wide blocklist."""
+        if not self.data.blocklist:
+            await ctx.send(embed=Embeds.info("The global blocklist is empty."), ephemeral=True)
+            return
+        entries = "\n".join(f"> `{w}`" for w in sorted(self.data.blocklist))
+        await ctx.send(embed=Embeds.blocklist(entries, len(self.data.blocklist)), ephemeral=True)
+
+    @filter_group.command(name="clear", description="Clear the entire global blocklist.")
+    @is_sudo()
+    async def filter_clear(self, ctx: commands.Context[commands.Bot]) -> None:
+        """Remove all entries from the global network-wide blocklist at once."""
+        count = len(self.data.blocklist)
+        if count == 0:
+            await ctx.send(embed=Embeds.info("The global blocklist is already empty."), ephemeral=True)
+            return
+        await self.data.blocklist_clear()
+        log.info("Filter:clear — %d entries removed by %d", count, ctx.author.id)
+        await ctx.send(
+            embed=Embeds.action(
+                f"Global blocklist cleared — {count} entr{'y' if count == 1 else 'ies'} removed.",
+                ctx.author,
+            ),
+            ephemeral=True,
+        )
+
 
 async def setup(bot: MusubiBot) -> None:
     await bot.add_cog(Sudo(bot))

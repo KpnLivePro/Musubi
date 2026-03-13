@@ -87,18 +87,13 @@ class InviteCog(commands.Cog, name="Invite"):
 
     # ── /invite ───────────────────────────────────────────────────────────
 
-    @commands.hybrid_group(
+    @commands.hybrid_command(
         name="invite",
-        description="Send your server's invite to the other side of a call, or manage invite quota.",
+        aliases=["inv", "join"],
+        description="Send your server's invite link to the other side of the current call.",
     )
     async def invite(self, ctx: commands.Context[MusubiBot]) -> None:
-        if ctx.invoked_subcommand is None:
-            # Running /invite with no subcommand = send invite (the common case)
-            await self._send_invite(ctx)
-
-    @invite.command(name="send", description="Send your server's invite to the other side of this call.")
-    async def invite_send(self, ctx: commands.Context[MusubiBot]) -> None:
-        """Send your server's invite link to the server you're currently on a call with."""
+        """Send your server's permanent invite to the server you're on a call with."""
         await self._send_invite(ctx)
 
     async def _send_invite(self, ctx: commands.Context[MusubiBot]) -> None:
@@ -221,7 +216,7 @@ class InviteCog(commands.Cog, name="Invite"):
 
     # ── /invite status ────────────────────────────────────────────────────
 
-    @invite.command(name="status", description="Check this server's invite quota and XP balance.")
+    @commands.hybrid_command(name="invitestatus", aliases=["invstatus"], description="Check this server's invite quota and XP balance.")
     async def invite_status(self, ctx: commands.Context[MusubiBot]) -> None:
         """View today's invite usage, purchased quota, and available XP tiers."""
         assert ctx.guild is not None
@@ -245,7 +240,7 @@ class InviteCog(commands.Cog, name="Invite"):
 
     # ── /invite buy ───────────────────────────────────────────────────────
 
-    @invite.command(name="buy", description="Spend server XP to buy extra invite quota. (Manage Messages required)")
+    @commands.hybrid_command(name="invitebuy", aliases=["invbuy"], description="Spend server XP to buy extra invite quota. (Manage Messages required)")
     async def invite_buy(
         self,
         ctx: commands.Context[MusubiBot],
