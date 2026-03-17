@@ -63,4 +63,4 @@ jobs:
         with:
           app-name: 'Musubi'
           slot-name: 'Production'
-          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_B4D03ADCE5E24CEAA040B11AA30CC741 }}
+          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_C6E5EC1D263B40E0B474DCCD6116A983 }}
