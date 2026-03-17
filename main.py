@@ -19,24 +19,23 @@ from dotenv import load_dotenv
 from botprotocol import MusubiBot
 from datamanager import DataManager
 from embeds import Embeds
-from flank import start as start_server
 
 load_dotenv()
 
-TOKEN        = os.getenv("DISCORD_TOKEN")
-_owner       = os.getenv("OWNER_ID")
+TOKEN        = os.environ.get("DISCORD_TOKEN")
+_owner       = os.environ.get("OWNER_ID")
 OWNER_ID:int = int(_owner) if _owner else 0
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 if not TOKEN:
-    sys.exit("DISCORD_TOKEN not set in .env")
+    sys.exit("DISCORD_TOKEN not set")
 if not OWNER_ID:
-    sys.exit("OWNER_ID not set in .env")
+    sys.exit("OWNER_ID not set")
 if not SUPABASE_URL:
-    sys.exit("SUPABASE_URL not set in .env")
+    sys.exit("SUPABASE_URL not set")
 if not SUPABASE_KEY:
-    sys.exit("SUPABASE_KEY not set in .env")
+    sys.exit("SUPABASE_KEY not set")
 
 DEFAULT_PREFIX = "m."
 
@@ -118,7 +117,6 @@ class Musubi(MusubiBot):
             )
         )
 
-
     async def on_guild_join(self, guild: discord.Guild) -> None:
         """DM the server owner a welcome embed when Musubi joins."""
         owner = guild.owner
@@ -138,7 +136,6 @@ class Musubi(MusubiBot):
             log.info("Welcome DM sent — guild:%d owner:%d", guild.id, owner.id)
         except (discord.Forbidden, discord.HTTPException):
             log.info("Welcome DM blocked — owner:%d, falling back to first channel", owner.id)
-            # Fall back to the first channel the bot can send messages in
             channel = next(
                 (
                     c for c in guild.text_channels
@@ -230,6 +227,7 @@ class Musubi(MusubiBot):
 
     async def close(self) -> None:
         log.info("Shutting down.")
+        await self.data.close()
         await super().close()
 
 
@@ -240,20 +238,16 @@ def resolve_prefix(bot: Musubi, message: discord.Message) -> list[str]:
       2. User personal prefix — premium users, works everywhere including DMs
       3. Guild prefix — server-specific, guild messages only
       4. Default prefix — m.
-    Both user and guild prefix are included when set so either works simultaneously.
-    Duplicates are deduplicated (e.g. if user and guild set the same prefix).
     """
     mention_prefixes = list(commands.when_mentioned(bot, message))
     data: DataManager = bot.data
 
     extra: list[str] = []
 
-    # User personal prefix — works in guilds and DMs
     u = data.get_user(message.author.id)
     if u.get("prefix"):
         extra.append(u["prefix"])
 
-    # Guild prefix — only in guild messages
     if message.guild:
         g = data.get_guild(message.guild.id)
         if g and g.get("prefix"):
@@ -261,7 +255,6 @@ def resolve_prefix(bot: Musubi, message: discord.Message) -> list[str]:
             if guild_pfx not in extra:
                 extra.append(guild_pfx)
 
-    # Default prefix — always available as fallback
     if DEFAULT_PREFIX not in extra:
         extra.append(DEFAULT_PREFIX)
 
@@ -296,7 +289,6 @@ log = logging.getLogger("musubi.main")
 
 async def main() -> None:
     setup_logging()
-    start_server()
     log.info("Starting Project MUSUBI...")
 
     async with ClientSession() as web_session:
