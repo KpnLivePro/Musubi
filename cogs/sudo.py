@@ -1,31 +1,46 @@
 """
 Project MUSUBI — cogs/sudo.py
-Bot administration commands. All commands live under /sudo.
+Bot administration commands. All nest under m.sudo (prefix) or /sudo (hybrid).
+
+Structured after Denki's sudo cog — sudo users get access via cog_check,
+owner-only commands are guarded separately.
 
 Structure:
-  /sudo list                          — list sudo users
-  /sudo add/remove <user>             — manage sudo users (owner only)
-  /sudo ban user <user>               — ban a user from the network
-  /sudo ban unban <user>              — unban a user
-  /sudo ban guild [guild_id]          — ban a guild from the network
-  /sudo ban unguild [guild_id]        — unban a guild
-  /sudo grant user <user> [days]      — grant user premium directly
-  /sudo grant guild [days]            — grant guild premium to this server
-  /sudo key gen <type> [days]         — generate a redeemable key
-  /sudo key list                      — list unredeemed keys
-  /sudo key revoke <key>              — revoke a key
-  /sudo session list                  — list active calls
-  /sudo session terminate <id>        — force-end a session
-  /sudo session broadcast <msg>       — message all active booth channels
-  /sudo reload cog <name>             — reload a specific cog (owner only)
-  /sudo reload all                    — reload all cogs (owner only)
+  m.sudo                              — help overview
+  m.sudo list                         — list sudo users
+  m.sudo add <user>                   — add sudo (owner only)
+  m.sudo remove <user>                — remove sudo (owner only)
+
+  m.ban user <@user>                  — ban a user from the network
+  m.ban unban <@user>                 — unban a user
+  m.ban guild [guild_id]              — ban a guild
+  m.ban unguild [guild_id]            — unban a guild
+
+  m.grant user <@user> [days]         — grant user premium
+  m.grant guild [days]                — grant guild premium to this server
+
+  m.key gen <user|guild> [days]       — generate a premium key
+  m.key list                          — list unredeemed keys
+  m.key revoke <key>                  — revoke a key
+
+  m.session list                      — list active calls
+  m.session terminate <id>            — force-end a session
+  m.session broadcast <msg>           — broadcast to all booth channels
+
+  m.website status                    — check live stats served to the website
+  m.website ping                      — verify push connection + secret
+
+  m.reload cog <name>                 — reload a cog (owner only)
+  m.reload all                        — reload all cogs (owner only)
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import time
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import discord
 from discord.ext import commands
@@ -36,78 +51,66 @@ from botprotocol import MusubiBot
 
 log = logging.getLogger("musubi.sudo")
 
+_start_time: float = time.time()
 
-def is_sudo():
-    async def predicate(ctx: commands.Context[MusubiBot]) -> bool:
-        data: DataManager = ctx.bot.data
-        if not data.is_sudo(ctx.author.id):
+
+def _fmt_uptime(seconds: int) -> str:
+    days, rem  = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    mins, secs = divmod(rem, 60)
+    return f"{days}d {hours}h {mins}m {secs}s"
+
+
+# ── Sudo Cog ──────────────────────────────────────────────────────────────────
+
+class Sudo(commands.Cog):
+    """Owner/sudo-only prefix commands. All nest under m."""
+
+    def __init__(self, bot: MusubiBot) -> None:
+        self.bot  = bot
+        self.data: DataManager = bot.data
+
+    async def cog_check(self, ctx: commands.Context[Any]) -> bool:  # type: ignore[override]
+        """Gate: must be sudo user (or owner). Owner is always sudo-seeded at startup."""
+        if not self.data.is_sudo(ctx.author.id):
             await ctx.send(
                 embed=Embeds.error("You don't have permission to use this command."),
                 ephemeral=True,
             )
             return False
         return True
-    return commands.check(predicate)
 
+    def _is_owner(self, user_id: int) -> bool:
+        owner = int(os.environ.get("OWNER_ID", "0"))
+        return user_id == owner
 
-def is_owner():
-    async def predicate(ctx: commands.Context[MusubiBot]) -> bool:
-        owner_id = int(os.getenv("OWNER_ID", "0"))
-        if ctx.author.id != owner_id:
-            await ctx.send(embed=Embeds.error("This command is restricted to the bot owner."), ephemeral=True)
-            return False
-        return True
-    return commands.check(predicate)
+    # ── m.sudo (help) ─────────────────────────────────────────────────────────
 
+    @commands.group(name="sudo", invoke_without_command=True)
+    async def sudo_help(self, ctx: commands.Context[Any]) -> None:
+        embed = Embeds.info(
+            "**Groups:** `ban`, `grant`, `key`, `session`, `website`, `reload`\n"
+            "**Commands:** `list`, `add`, `remove`"
+        )
+        await ctx.send(embed=embed, ephemeral=True)
 
-class Sudo(commands.Cog):
+    # ── m.sudo list / add / remove ────────────────────────────────────────────
 
-    def __init__(self, bot: MusubiBot) -> None:
-        self.bot  = bot
-        self.data: DataManager = bot.data
-
-    # ── /sudo (root) ──────────────────────────────────────────────────────
-
-    @commands.hybrid_group(name="sudo", description="Bot administration.")
-    @discord.app_commands.default_permissions(administrator=True)
-    @is_sudo()
-    async def sudo(self, ctx: commands.Context[MusubiBot]) -> None:
-        if ctx.invoked_subcommand is None:
-            await ctx.send(
-                embed=Embeds.info(
-                    "**Groups:** `ban`, `grant`, `key`, `session`, `reload`\n"
-                    "**Commands:** `list`, `add`, `remove`"
-                ),
-                ephemeral=True,
-            )
-
-    # ── /sudo list/add/remove ─────────────────────────────────────────────
-
-    @sudo.command(name="list", description="List all users with sudo privileges.")
-    @is_sudo()
-    async def sudo_list(self, ctx: commands.Context[MusubiBot]) -> None:
-        """List all users currently granted sudo privileges."""
+    @sudo_help.command(name="list")
+    async def sudo_list(self, ctx: commands.Context[Any]) -> None:
+        """List all users with sudo privileges."""
         if not self.data.sudo:
             await ctx.send(embed=Embeds.info("No sudo users are currently configured."), ephemeral=True)
             return
         lines = "\n".join(f"> <@{uid}>" for uid in self.data.sudo)
         await ctx.send(embed=Embeds.sudo_list(lines), ephemeral=True)
 
-    @sudo.command(name="add", description="Grant sudo privileges to a user. (Owner only)")
-    @is_owner()
-    async def sudo_add(
-        self,
-        ctx: commands.Context[MusubiBot],
-        user: discord.User,
-    ) -> None:
-        """
-        Grant sudo privileges to a user.
-
-        Parameters
-        ----------
-        user: discord.User
-            The user to grant sudo to.
-        """
+    @sudo_help.command(name="add")
+    async def sudo_add(self, ctx: commands.Context[Any], user: discord.User) -> None:
+        """Grant sudo to a user. Owner only."""
+        if not self._is_owner(ctx.author.id):
+            await ctx.send(embed=Embeds.error("This command is restricted to the bot owner."), ephemeral=True)
+            return
         if self.data.is_sudo(user.id):
             await ctx.send(embed=Embeds.info(f"**{user}** already has sudo privileges."), ephemeral=True)
             return
@@ -118,21 +121,12 @@ class Sudo(commands.Cog):
             ephemeral=True,
         )
 
-    @sudo.command(name="remove", description="Revoke sudo privileges from a user. (Owner only)")
-    @is_owner()
-    async def sudo_remove(
-        self,
-        ctx: commands.Context[MusubiBot],
-        user: discord.User,
-    ) -> None:
-        """
-        Revoke sudo privileges from a user.
-
-        Parameters
-        ----------
-        user: discord.User
-            The user to revoke sudo from.
-        """
+    @sudo_help.command(name="remove")
+    async def sudo_remove(self, ctx: commands.Context[Any], user: discord.User) -> None:
+        """Revoke sudo from a user. Owner only."""
+        if not self._is_owner(ctx.author.id):
+            await ctx.send(embed=Embeds.error("This command is restricted to the bot owner."), ephemeral=True)
+            return
         if not self.data.is_sudo(user.id):
             await ctx.send(embed=Embeds.info(f"**{user}** does not have sudo privileges."), ephemeral=True)
             return
@@ -143,35 +137,21 @@ class Sudo(commands.Cog):
             ephemeral=True,
         )
 
-    # ── /sudo ban ─────────────────────────────────────────────────────────
+    # ── m.ban ─────────────────────────────────────────────────────────────────
 
-    @sudo.group(name="ban", description="Ban or unban users and guilds from the network.")
-    @is_sudo()
-    async def ban(self, ctx: commands.Context[MusubiBot]) -> None:
-        if ctx.invoked_subcommand is None:
-            await ctx.send(
-                embed=Embeds.info(
-                    "Available subcommands: `user <@user>`, `unban <@user>`, "
-                    "`guild [guild_id]`, `unguild [guild_id]`"
-                ),
-                ephemeral=True,
-            )
+    @commands.group(name="ban", invoke_without_command=True)
+    async def ban(self, ctx: commands.Context[Any]) -> None:
+        await ctx.send(
+            embed=Embeds.info(
+                "Available subcommands: `user <@user>`, `unban <@user>`, "
+                "`guild [guild_id]`, `unguild [guild_id]`"
+            ),
+            ephemeral=True,
+        )
 
-    @ban.command(name="user", description="Ban a user from relaying messages on the network.")
-    @is_sudo()
-    async def ban_user(
-        self,
-        ctx: commands.Context[MusubiBot],
-        user: discord.User,
-    ) -> None:
-        """
-        Ban a user from sending messages across the relay network.
-
-        Parameters
-        ----------
-        user: discord.User
-            The user to ban.
-        """
+    @ban.command(name="user")
+    async def ban_user(self, ctx: commands.Context[Any], user: discord.User) -> None:
+        """Ban a user from the relay network."""
         if self.data.is_user_banned(user.id):
             await ctx.send(embed=Embeds.info(f"**{user}** is already banned from the network."), ephemeral=True)
             return
@@ -182,21 +162,9 @@ class Sudo(commands.Cog):
             ephemeral=True,
         )
 
-    @ban.command(name="unban", description="Unban a user from the network.")
-    @is_sudo()
-    async def ban_unban(
-        self,
-        ctx: commands.Context[MusubiBot],
-        user: discord.User,
-    ) -> None:
-        """
-        Unban a user from the relay network.
-
-        Parameters
-        ----------
-        user: discord.User
-            The user to unban.
-        """
+    @ban.command(name="unban")
+    async def ban_unban(self, ctx: commands.Context[Any], user: discord.User) -> None:
+        """Unban a user from the relay network."""
         if not self.data.is_user_banned(user.id):
             await ctx.send(embed=Embeds.info(f"**{user}** is not currently banned."), ephemeral=True)
             return
@@ -207,21 +175,9 @@ class Sudo(commands.Cog):
             ephemeral=True,
         )
 
-    @ban.command(name="guild", description="Ban a server from the network by ID, or this server if no ID given.")
-    @is_sudo()
-    async def ban_guild(
-        self,
-        ctx: commands.Context[MusubiBot],
-        guild_id: str | None = None,
-    ) -> None:
-        """
-        Ban a guild from the network. Provide a guild ID or run inside the target server.
-
-        Parameters
-        ----------
-        guild_id: str
-            The Discord guild ID to ban. Leave blank to ban the current server.
-        """
+    @ban.command(name="guild")
+    async def ban_guild(self, ctx: commands.Context[Any], guild_id: str | None = None) -> None:
+        """Ban a guild by ID, or the current server if no ID given."""
         gid = guild_id or (str(ctx.guild.id) if ctx.guild else None)
         if not gid:
             await ctx.send(
@@ -230,10 +186,7 @@ class Sudo(commands.Cog):
             )
             return
         if not self.data.is_guild_registered(gid):
-            await ctx.send(
-                embed=Embeds.error(f"Guild `{gid}` is not registered on the network."),
-                ephemeral=True,
-            )
+            await ctx.send(embed=Embeds.error(f"Guild `{gid}` is not registered on the network."), ephemeral=True)
             return
         if self.data.is_guild_banned(gid):
             await ctx.send(embed=Embeds.info(f"Guild `{gid}` is already banned."), ephemeral=True)
@@ -245,21 +198,9 @@ class Sudo(commands.Cog):
             ephemeral=True,
         )
 
-    @ban.command(name="unguild", description="Unban a server from the network.")
-    @is_sudo()
-    async def ban_unguild(
-        self,
-        ctx: commands.Context[MusubiBot],
-        guild_id: str | None = None,
-    ) -> None:
-        """
-        Unban a guild from the network.
-
-        Parameters
-        ----------
-        guild_id: str
-            The Discord guild ID to unban. Leave blank to unban the current server.
-        """
+    @ban.command(name="unguild")
+    async def ban_unguild(self, ctx: commands.Context[Any], guild_id: str | None = None) -> None:
+        """Unban a guild from the network."""
         gid = guild_id or (str(ctx.guild.id) if ctx.guild else None)
         if not gid:
             await ctx.send(
@@ -277,38 +218,21 @@ class Sudo(commands.Cog):
             ephemeral=True,
         )
 
-    # ── /sudo grant ───────────────────────────────────────────────────────
+    # ── m.grant ───────────────────────────────────────────────────────────────
 
-    @sudo.group(name="grant", description="Grant premium to a user or server.")
-    @is_sudo()
-    async def grant(self, ctx: commands.Context[MusubiBot]) -> None:
-        if ctx.invoked_subcommand is None:
-            await ctx.send(
-                embed=Embeds.info(
-                    "`grant user <@user> [days]` — grant personal premium to a user\n"
-                    "`grant guild [days]` — grant server premium to this server"
-                ),
-                ephemeral=True,
-            )
+    @commands.group(name="grant", invoke_without_command=True)
+    async def grant(self, ctx: commands.Context[Any]) -> None:
+        await ctx.send(
+            embed=Embeds.info(
+                "`grant user <@user> [days]` — grant personal premium to a user\n"
+                "`grant guild [days]` — grant server premium to this server"
+            ),
+            ephemeral=True,
+        )
 
-    @grant.command(name="user", description="Grant personal premium directly to a user.")
-    @is_sudo()
-    async def grant_user(
-        self,
-        ctx: commands.Context[MusubiBot],
-        user: discord.User,
-        days: int = 30,
-    ) -> None:
-        """
-        Grant personal premium directly to a user without a key.
-
-        Parameters
-        ----------
-        user: discord.User
-            The user to grant premium to.
-        days: int
-            How many days the subscription lasts (default: 30, max: 365).
-        """
+    @grant.command(name="user")
+    async def grant_user(self, ctx: commands.Context[Any], user: discord.User, days: int = 30) -> None:
+        """Grant personal premium directly to a user."""
         if days < 1 or days > 365:
             await ctx.send(embed=Embeds.error("Days must be between 1 and 365."), ephemeral=True)
             return
@@ -326,22 +250,9 @@ class Sudo(commands.Cog):
             ephemeral=True,
         )
 
-    @grant.command(name="guild", description="Grant server premium to this server.")
-    @is_sudo()
-    async def grant_guild(
-        self,
-        ctx: commands.Context[MusubiBot],
-        days: int = 30,
-    ) -> None:
-        """
-        Grant server premium to the current server.
-        Run this command inside the target server.
-
-        Parameters
-        ----------
-        days: int
-            How many days the subscription lasts (default: 30, max: 365).
-        """
+    @grant.command(name="guild")
+    async def grant_guild(self, ctx: commands.Context[Any], days: int = 30) -> None:
+        """Grant server premium to the current server."""
         if not ctx.guild:
             await ctx.send(
                 embed=Embeds.error("Run this command inside the server you want to grant premium to."),
@@ -371,35 +282,18 @@ class Sudo(commands.Cog):
             ephemeral=True,
         )
 
-    # ── /sudo key ─────────────────────────────────────────────────────────
+    # ── m.key ─────────────────────────────────────────────────────────────────
 
-    @sudo.group(name="key", description="Manage premium keys.")
-    @is_sudo()
-    async def key(self, ctx: commands.Context[MusubiBot]) -> None:
-        if ctx.invoked_subcommand is None:
-            await ctx.send(
-                embed=Embeds.info("Available subcommands: `gen <user|guild> [days]`, `list`, `revoke <key>`"),
-                ephemeral=True,
-            )
+    @commands.group(name="key", invoke_without_command=True)
+    async def key(self, ctx: commands.Context[Any]) -> None:
+        await ctx.send(
+            embed=Embeds.info("Available subcommands: `gen <user|guild> [days]`, `list`, `revoke <key>`"),
+            ephemeral=True,
+        )
 
-    @key.command(name="gen", description="Generate a redeemable premium key.")
-    @is_sudo()
-    async def key_gen(
-        self,
-        ctx: commands.Context[MusubiBot],
-        key_type: str,
-        days: int = 30,
-    ) -> None:
-        """
-        Generate a redeemable premium key. The key is sent to your DMs.
-
-        Parameters
-        ----------
-        key_type: str
-            The type of premium: `user` (personal) or `guild` (server).
-        days: int
-            How many days the key grants when redeemed (default: 30, max: 365).
-        """
+    @key.command(name="gen")
+    async def key_gen(self, ctx: commands.Context[Any], key_type: str, days: int = 30) -> None:
+        """Generate a redeemable premium key. Sent to your DMs."""
         if key_type not in ("user", "guild"):
             await ctx.send(
                 embed=Embeds.error("Key type must be `user` (personal premium) or `guild` (server premium)."),
@@ -410,11 +304,11 @@ class Sudo(commands.Cog):
             await ctx.send(embed=Embeds.error("Days must be between 1 and 365."), ephemeral=True)
             return
 
-        key = await self.data.create_key(key_type, days, ctx.author.id)
-        log.info("Key generated — type:%s days:%d key:%s by:%d", key_type, days, key, ctx.author.id)
+        generated_key = await self.data.create_key(key_type, days, ctx.author.id)
+        log.info("Key generated — type:%s days:%d key:%s by:%d", key_type, days, generated_key, ctx.author.id)
 
         try:
-            await ctx.author.send(embed=Embeds.premium_key(key, key_type))
+            await ctx.author.send(embed=Embeds.premium_key(generated_key, key_type))
         except discord.Forbidden:
             pass
 
@@ -427,10 +321,9 @@ class Sudo(commands.Cog):
             ephemeral=True,
         )
 
-    @key.command(name="list", description="List all unredeemed premium keys.")
-    @is_sudo()
-    async def key_list(self, ctx: commands.Context[MusubiBot]) -> None:
-        """Show all premium keys that have not yet been redeemed."""
+    @key.command(name="list")
+    async def key_list(self, ctx: commands.Context[Any]) -> None:
+        """List all unredeemed premium keys."""
         rows = await self.data.get_unused_keys()
         if not rows:
             await ctx.send(embed=Embeds.info("There are no unredeemed keys."), ephemeral=True)
@@ -443,7 +336,6 @@ class Sudo(commands.Cog):
                 time_str = f"<t:{ts}:R>"
             except Exception:
                 time_str = r["created_at"][:10]
-
             label = "Personal" if r["type"] == "user" else "Server"
             lines.append(f"> `{r['key']}` — `{label}` · **{r['days']}d** · {time_str}")
 
@@ -455,21 +347,9 @@ class Sudo(commands.Cog):
             embed.set_footer(text=f"Showing 20 of {len(rows)}")
         await ctx.send(embed=embed, ephemeral=True)
 
-    @key.command(name="revoke", description="Revoke an unredeemed premium key.")
-    @is_sudo()
-    async def key_revoke(
-        self,
-        ctx: commands.Context[MusubiBot],
-        key: str,
-    ) -> None:
-        """
-        Permanently revoke a key so it can no longer be redeemed.
-
-        Parameters
-        ----------
-        key: str
-            The key to revoke (format: MSBY-XXXX-XXXX-XXXX).
-        """
+    @key.command(name="revoke")
+    async def key_revoke(self, ctx: commands.Context[Any], key: str) -> None:
+        """Permanently revoke an unredeemed key."""
         ok = await self.data.revoke_key(key)
         if ok:
             await ctx.send(
@@ -479,21 +359,18 @@ class Sudo(commands.Cog):
         else:
             await ctx.send(embed=Embeds.error("Key not found or could not be revoked."), ephemeral=True)
 
-    # ── /sudo session ─────────────────────────────────────────────────────
+    # ── m.session ─────────────────────────────────────────────────────────────
 
-    @sudo.group(name="session", description="View and manage active calls.")
-    @is_sudo()
-    async def session(self, ctx: commands.Context[MusubiBot]) -> None:
-        if ctx.invoked_subcommand is None:
-            await ctx.send(
-                embed=Embeds.info("Available subcommands: `list`, `terminate <id>`, `broadcast <message>`"),
-                ephemeral=True,
-            )
+    @commands.group(name="session", invoke_without_command=True)
+    async def session(self, ctx: commands.Context[Any]) -> None:
+        await ctx.send(
+            embed=Embeds.info("Available subcommands: `list`, `terminate <id>`, `broadcast <message>`"),
+            ephemeral=True,
+        )
 
-    @session.command(name="list", description="List all active calls with details.")
-    @is_sudo()
-    async def session_list(self, ctx: commands.Context[MusubiBot]) -> None:
-        """View all active calls across the network with timestamps."""
+    @session.command(name="list")
+    async def session_list(self, ctx: commands.Context[Any]) -> None:
+        """List all active calls across the network."""
         try:
             rows = await self.data._get("Sessions", {
                 "select": "id,caller_guild,target_guild,last_activity",
@@ -515,21 +392,9 @@ class Sudo(commands.Cog):
         )
         await ctx.send(embed=Embeds.session_active(count, lines, count), ephemeral=True)
 
-    @session.command(name="terminate", description="Force-end an active call by session ID.")
-    @is_sudo()
-    async def session_terminate(
-        self,
-        ctx: commands.Context[MusubiBot],
-        session_id: str,
-    ) -> None:
-        """
-        Force-terminate an active call and notify both servers.
-
-        Parameters
-        ----------
-        session_id: str
-            The session ID or first 8 characters shown in /sudo session list.
-        """
+    @session.command(name="terminate")
+    async def session_terminate(self, ctx: commands.Context[Any], session_id: str) -> None:
+        """Force-end an active call by session ID (or first 8 chars)."""
         try:
             rows = await self.data._get("Sessions", {"select": "*", "status": "eq.active"})
         except Exception as e:
@@ -544,14 +409,12 @@ class Sudo(commands.Cog):
             )
             return
 
-        # Notify both sides before ending
         from cogs.phone import Phone
         from typing import cast
         phone_cog = cast(Phone, self.bot.cogs.get("Phone"))
         if phone_cog:
             await phone_cog._notify_end(match, reason="terminate")
 
-        # End the single session row — this is the correct approach given the schema
         await self.data.end_session(match["id"])
 
         if phone_cog:
@@ -563,22 +426,9 @@ class Sudo(commands.Cog):
             ephemeral=True,
         )
 
-    @session.command(name="broadcast", description="Send a message to all active booth channels.")
-    @is_sudo()
-    async def session_broadcast(
-        self,
-        ctx: commands.Context[MusubiBot],
-        *,
-        message: str,
-    ) -> None:
-        """
-        Broadcast a system notice to every active booth channel on the network.
-
-        Parameters
-        ----------
-        message: str
-            The message to broadcast.
-        """
+    @session.command(name="broadcast")
+    async def session_broadcast(self, ctx: commands.Context[Any], *, message: str) -> None:
+        """Send a network notice to every active booth channel."""
         try:
             rows = await self.data._get("Sessions", {"select": "*", "status": "eq.active"})
         except Exception as e:
@@ -602,36 +452,174 @@ class Sudo(commands.Cog):
                     sent.add(channel_id)
 
         await ctx.send(
-            embed=Embeds.action(f"Broadcast sent to {len(sent)} channel{'s' if len(sent) != 1 else ''}.", ctx.author),
+            embed=Embeds.action(
+                f"Broadcast sent to {len(sent)} channel{'s' if len(sent) != 1 else ''}.",
+                ctx.author,
+            ),
             ephemeral=True,
         )
 
-    # ── /sudo reload ──────────────────────────────────────────────────────
+    # ── m.website ─────────────────────────────────────────────────────────────
 
-    @sudo.group(name="reload", description="Reload bot extensions. (Owner only)")
-    @is_owner()
-    async def reload(self, ctx: commands.Context[MusubiBot]) -> None:
-        if ctx.invoked_subcommand is None:
+    @commands.group(name="website", invoke_without_command=True)
+    async def website(self, ctx: commands.Context[Any]) -> None:
+        await ctx.send(
+            embed=Embeds.info("Available subcommands: `status`, `ping`"),
+            ephemeral=True,
+        )
+
+    @website.command(name="status")
+    async def website_status(self, ctx: commands.Context[Any]) -> None:
+        """Fetch live stats from the KpnWorld API and display connection health."""
+        import httpx
+        from datetime import datetime, timezone
+
+        url = (os.environ.get("WEBSITE_URL") or "").rstrip("/") + "/api/musubi/stats"
+
+        if not url.startswith("http"):
+            await ctx.send(embed=Embeds.error("WEBSITE_URL is not configured on this bot."), ephemeral=True)
+            return
+
+        start = time.monotonic()
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                r = await client.get(url)
+            latency = int((time.monotonic() - start) * 1000)
+
+            if r.status_code != 200:
+                await ctx.send(
+                    embed=Embeds.error(f"API returned HTTP `{r.status_code}` — check the Flask service."),
+                    ephemeral=True,
+                )
+                return
+
+            data = r.json()
+
+        except Exception as e:
+            latency = int((time.monotonic() - start) * 1000)
             await ctx.send(
-                embed=Embeds.info("Available subcommands: `cog <name>`, `all`"),
+                embed=Embeds.error(f"Could not reach the API (`{latency}ms`):\n```{e}```"),
+                ephemeral=True,
+            )
+            return
+
+        # Format push age
+        received_at = data.get("push_received_at")
+        if received_at:
+            try:
+                pushed = datetime.fromisoformat(received_at.replace("Z", "+00:00"))
+                diff   = int((datetime.now(timezone.utc) - pushed).total_seconds())
+                age    = f"{diff}s ago" if diff < 60 else f"{diff // 60}m ago" if diff < 3600 else f"{diff // 3600}h ago"
+                pushed_str = f"`{age}`"
+            except Exception:
+                pushed_str = f"`{received_at[:19]}`"
+        else:
+            pushed_str = "`never — bot may not have pushed yet`"
+
+        # Callboard preview
+        callboard = data.get("callboard") or []
+        MEDALS = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣"]
+        board_lines = "\n".join(
+            f"> {MEDALS[i] if i < len(MEDALS) else f'`#{i+1}`'} **{row.get('guild_name', '—')}** — `{row.get('xp', 0):,} XP`"
+            for i, row in enumerate(callboard[:7])
+        ) or "> *No callboard data yet*"
+
+        guild_count  = data.get("guild_count")
+        user_count   = data.get("user_count")
+        active_calls = data.get("active_calls")
+        reg_guilds   = data.get("registered_guilds")
+        total_users  = data.get("total_users")
+        user_str     = f"`{user_count:,}`" if isinstance(user_count, int) else "`—`"
+
+        embed = discord.Embed(
+            description=(
+                f"> `🌐` *KpnWorld API Status*\n\n"
+                f"> `✅` *Connection:* `{latency}ms`\n"
+                f"> `📡` *Last bot push:* {pushed_str}\n\n"
+                f"> `🏠` *Guild count (Discord):* `{guild_count if guild_count is not None else '—'}`\n"
+                f"> `👥` *User count (live):* {user_str}\n"
+                f"> `📞` *Active calls:* `{active_calls if active_calls is not None else '—'}`\n"
+                f"> `📋` *Registered guilds (DB):* `{reg_guilds if reg_guilds is not None else '—'}`\n"
+                f"> `🧑\u200d🤝\u200d🧑` *Total users (DB):* `{total_users if total_users is not None else '—'}`\n\n"
+                f"> `🏆` *Callboard ({len(callboard)} entries)*\n"
+                f"{board_lines}"
+            ),
+            color=0xC084FC,
+        )
+        embed.set_footer(text=f"GET {url}")
+        await ctx.send(embed=embed, ephemeral=True)
+
+    @website.command(name="ping")
+    async def website_ping(self, ctx: commands.Context[Any]) -> None:
+        """Send a test push to verify the API secret and connection."""
+        import httpx
+
+        base   = (os.environ.get("WEBSITE_URL") or "").rstrip("/")
+        secret = os.environ.get("MUSUBI_API_SECRET") or os.environ.get("API_SECRET") or ""
+
+        if not base.startswith("http"):
+            await ctx.send(embed=Embeds.error("WEBSITE_URL is not configured on this bot."), ephemeral=True)
+            return
+
+        if not secret:
+            await ctx.send(embed=Embeds.error("MUSUBI_API_SECRET / API_SECRET is not set on this bot."), ephemeral=True)
+            return
+
+        url   = base + "/api/musubi/push"
+        start = time.monotonic()
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                r = await client.post(
+                    url,
+                    json={"guild_count": 0, "user_count": 0, "active_calls": 0, "callboard": []},
+                    headers={"Content-Type": "application/json", "X-API-Secret": secret},
+                )
+            latency = int((time.monotonic() - start) * 1000)
+
+            if r.status_code == 200:
+                await ctx.send(
+                    embed=Embeds.action(
+                        f"Connection successful — secret is valid. (`{latency}ms`)\n"
+                        f"> Endpoint: `{url}`",
+                        ctx.author,
+                    ),
+                    ephemeral=True,
+                )
+            elif r.status_code == 401:
+                await ctx.send(
+                    embed=Embeds.error(
+                        f"API reachable but secret is **wrong** — got `401 Unauthorized`. (`{latency}ms`)\n"
+                        f"> Check that `MUSUBI_API_SECRET` matches `API_SECRET` on the Flask service."
+                    ),
+                    ephemeral=True,
+                )
+            else:
+                await ctx.send(
+                    embed=Embeds.error(f"Unexpected HTTP `{r.status_code}` from API. (`{latency}ms`)"),
+                    ephemeral=True,
+                )
+        except Exception as e:
+            latency = int((time.monotonic() - start) * 1000)
+            await ctx.send(
+                embed=Embeds.error(f"Could not reach API (`{latency}ms`):\n```{e}```"),
                 ephemeral=True,
             )
 
-    @reload.command(name="cog", description="Reload a specific cog by name.")
-    @is_owner()
-    async def reload_cog(
-        self,
-        ctx: commands.Context[MusubiBot],
-        name: str,
-    ) -> None:
-        """
-        Reload a specific cog by name.
+    # ── m.reload ──────────────────────────────────────────────────────────────
 
-        Parameters
-        ----------
-        name: str
-            The cog name, e.g. phone, bridge, sudo, filter.
-        """
+    @commands.group(name="reload", invoke_without_command=True)
+    async def reload(self, ctx: commands.Context[Any]) -> None:
+        await ctx.send(
+            embed=Embeds.info("Available subcommands: `cog <name>`, `all`"),
+            ephemeral=True,
+        )
+
+    @reload.command(name="cog")
+    async def reload_cog(self, ctx: commands.Context[Any], name: str) -> None:
+        """Reload a specific cog by name. Owner only."""
+        if not self._is_owner(ctx.author.id):
+            await ctx.send(embed=Embeds.error("This command is restricted to the bot owner."), ephemeral=True)
+            return
         ext = f"cogs.{name}" if not name.startswith("cogs.") else name
         try:
             await self.bot.reload_extension(ext)
@@ -648,10 +636,12 @@ class Sudo(commands.Cog):
             log.exception("Failed to reload %s", ext)
             await ctx.send(embed=Embeds.critical(e), ephemeral=True)
 
-    @reload.command(name="all", description="Reload all loaded cogs.")
-    @is_owner()
-    async def reload_all(self, ctx: commands.Context[MusubiBot]) -> None:
-        """Reload every loaded extension."""
+    @reload.command(name="all")
+    async def reload_all(self, ctx: commands.Context[Any]) -> None:
+        """Reload all loaded cogs. Owner only."""
+        if not self._is_owner(ctx.author.id):
+            await ctx.send(embed=Embeds.error("This command is restricted to the bot owner."), ephemeral=True)
+            return
         from main import INITIAL_EXTENSIONS
         lines = []
         for ext in INITIAL_EXTENSIONS:
@@ -663,101 +653,6 @@ class Sudo(commands.Cog):
         log.info("Reload all by %d", ctx.author.id)
         await ctx.send(embed=Embeds.reload_all(lines), ephemeral=True)
 
-    # ── /sudo filter ──────────────────────────────────────────────────────
 
-    @sudo.group(name="filter", description="Manage the global network-wide message blocklist.")
-    @is_sudo()
-    async def filter_group(self, ctx: commands.Context[commands.Bot]) -> None:
-        if ctx.invoked_subcommand is None:
-            await ctx.send(
-                embed=Embeds.info("Available subcommands: `add`, `remove`, `list`, `clear`"),
-                ephemeral=True,
-            )
-
-    @filter_group.command(name="add", description="Add phrases to the global blocklist.")
-    @is_sudo()
-    async def filter_add(
-        self,
-        ctx: commands.Context[commands.Bot],
-        *,
-        phrase: str,
-    ) -> None:
-        """
-        Add one or more comma-separated words or phrases to the global network blocklist.
-
-        Parameters
-        ----------
-        phrase: str
-            Comma-separated words or phrases to block (e.g. badword, slur, spam phrase).
-        """
-        entries = [p.strip().lower() for p in phrase.split(",") if p.strip()]
-        if not entries:
-            await ctx.send(embed=Embeds.error("No valid phrases provided."), ephemeral=True)
-            return
-        for entry in entries:
-            await self.data.blocklist_add(entry)
-        added = ", ".join(f"`{e}`" for e in entries)
-        log.info("Filter:add — %s by %d", entries, ctx.author.id)
-        await ctx.send(
-            embed=Embeds.action(f"Added to global blocklist: {added}", ctx.author),
-            ephemeral=True,
-        )
-
-    @filter_group.command(name="remove", description="Remove a phrase from the global blocklist.")
-    @is_sudo()
-    async def filter_remove(
-        self,
-        ctx: commands.Context[commands.Bot],
-        *,
-        phrase: str,
-    ) -> None:
-        """
-        Remove a word or phrase from the global network blocklist.
-
-        Parameters
-        ----------
-        phrase: str
-            The exact word or phrase to remove.
-        """
-        phrase = phrase.lower().strip()
-        if phrase not in self.data.blocklist:
-            await ctx.send(embed=Embeds.error(f"`{phrase}` is not in the global blocklist."), ephemeral=True)
-            return
-        await self.data.blocklist_remove(phrase)
-        log.info("Filter:remove — '%s' by %d", phrase, ctx.author.id)
-        await ctx.send(
-            embed=Embeds.action(f"`{phrase}` removed from the global blocklist.", ctx.author),
-            ephemeral=True,
-        )
-
-    @filter_group.command(name="list", description="List all entries in the global blocklist.")
-    @is_sudo()
-    async def filter_list(self, ctx: commands.Context[commands.Bot]) -> None:
-        """Show every phrase currently on the global network-wide blocklist."""
-        if not self.data.blocklist:
-            await ctx.send(embed=Embeds.info("The global blocklist is empty."), ephemeral=True)
-            return
-        entries = "\n".join(f"> `{w}`" for w in sorted(self.data.blocklist))
-        await ctx.send(embed=Embeds.blocklist(entries, len(self.data.blocklist)), ephemeral=True)
-
-    @filter_group.command(name="clear", description="Clear the entire global blocklist.")
-    @is_sudo()
-    async def filter_clear(self, ctx: commands.Context[commands.Bot]) -> None:
-        """Remove all entries from the global network-wide blocklist at once."""
-        count = len(self.data.blocklist)
-        if count == 0:
-            await ctx.send(embed=Embeds.info("The global blocklist is already empty."), ephemeral=True)
-            return
-        await self.data.blocklist_clear()
-        log.info("Filter:clear — %d entries removed by %d", count, ctx.author.id)
-        await ctx.send(
-            embed=Embeds.action(
-                f"Global blocklist cleared — {count} entr{'y' if count == 1 else 'ies'} removed.",
-                ctx.author,
-            ),
-            ephemeral=True,
-        )
-
-
-async def setup(bot: MusubiBot) -> None:
-    await bot.add_cog(Sudo(bot))
+async def setup(bot: commands.Bot) -> None:
+    await bot.add_cog(Sudo(bot))  # type: ignore[arg-type]

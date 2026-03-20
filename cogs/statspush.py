@@ -1,24 +1,13 @@
 """
 cogs/statspush.py  — Musubi bot repo
 ──────────────────────────────────────────────────────────────────────────────
-Pushes Discord-cache-only values to the KpnWorld website API.
+Pushes Discord-cache-only values to the KpnWorld website API every 60s.
 
-PUSH TRIGGERS:
-  1. Every 60s via push_loop (safety net / heartbeat)
-  2. Immediately on on_member_join  (member count went up)
-  3. Immediately on on_member_remove (member count went down)
-
-WHY: Supabase has persistent data (registered_guilds, XP, Users table).
-     Three things only exist in the bot's in-process state:
-       1. guild_count   — how many servers Musubi is currently in
-       2. user_count    — sum of member_count across all guilds (Discord's number)
-       3. active_calls  — live session count from DataManager
-       4. callboard     — top 7 entries with resolved guild names + icons
-
-SETUP:
-  Set on the Azure Container (musubi):
-    WEBSITE_URL       = https://kww-api.azurewebsites.net
-    MUSUBI_API_SECRET = <same secret set on kww-api App Service>
+User count strategy:
+  - Seeded on ready() by summing guild.member_count across all guilds.
+  - Maintained in real time via on_member_join / on_member_remove listeners.
+  - This avoids recalculating the full sum every 60s and stays accurate
+    between pushes without any DB reads.
 """
 
 from __future__ import annotations
@@ -36,9 +25,8 @@ from botprotocol import MusubiBot
 
 log = logging.getLogger("musubi.statspush")
 
-PUSH_INTERVAL     = 60    # seconds between scheduled pushes
-MEMBER_PUSH_DELAY = 2     # seconds to debounce rapid join/leave bursts
-HTTP_TIMEOUT      = aiohttp.ClientTimeout(total=8)
+PUSH_INTERVAL = 60
+HTTP_TIMEOUT  = aiohttp.ClientTimeout(total=8)
 
 
 def _url() -> str:
@@ -56,8 +44,7 @@ class StatsPush(commands.Cog, name="StatsPush"):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot: MusubiBot = cast(MusubiBot, bot)
         self._session: aiohttp.ClientSession | None = None
-        # Debounce handle — cancels a pending push if another event fires first
-        self._pending_push: asyncio.Task | None = None
+        self._user_count: int = 0
         self.push_loop.start()
 
     async def cog_load(self) -> None:
@@ -65,18 +52,41 @@ class StatsPush(commands.Cog, name="StatsPush"):
 
     async def cog_unload(self) -> None:
         self.push_loop.cancel()
-        if self._pending_push and not self._pending_push.done():
-            self._pending_push.cancel()
         if self._session and not self._session.closed:
             await self._session.close()
 
-    # ── Payload builder ───────────────────────────────────────────────────
+    # ── User count listeners ──────────────────────────────────────────────────
+
+    @commands.Cog.listener()
+    async def on_ready(self) -> None:
+        """Seed the user count once the bot is ready and all guilds are loaded."""
+        self._user_count = sum(g.member_count or 0 for g in self.bot.guilds)
+        log.debug("statspush: user_count seeded at %d", self._user_count)
+
+    @commands.Cog.listener()
+    async def on_member_join(self, member: discord.Member) -> None:
+        self._user_count += 1
+
+    @commands.Cog.listener()
+    async def on_member_remove(self, member: discord.Member) -> None:
+        self._user_count = max(0, self._user_count - 1)
+
+    @commands.Cog.listener()
+    async def on_guild_join(self, guild: discord.Guild) -> None:
+        """When the bot joins a new server, add that server's member count."""
+        self._user_count += guild.member_count or 0
+        log.debug("statspush: guild joined (%d members), user_count now %d", guild.member_count or 0, self._user_count)
+
+    @commands.Cog.listener()
+    async def on_guild_remove(self, guild: discord.Guild) -> None:
+        """When the bot leaves a server, subtract that server's member count."""
+        self._user_count = max(0, self._user_count - (guild.member_count or 0))
+        log.debug("statspush: guild removed (%d members), user_count now %d", guild.member_count or 0, self._user_count)
+
+    # ── Payload builder ───────────────────────────────────────────────────────
 
     async def _build_payload(self) -> dict:
-        guild_count = len(self.bot.guilds)
-        # member_count is Discord's cached value — always accurate without chunking
-        user_count  = sum(g.member_count or 0 for g in self.bot.guilds)
-
+        guild_count  = len(self.bot.guilds)
         active_calls = 0
         try:
             active_calls = await self.bot.data.count_active_calls()
@@ -101,12 +111,12 @@ class StatsPush(commands.Cog, name="StatsPush"):
 
         return {
             "guild_count":  guild_count,
-            "user_count":   user_count,
+            "user_count":   self._user_count,
             "active_calls": active_calls,
             "callboard":    callboard,
         }
 
-    # ── HTTP post ─────────────────────────────────────────────────────────
+    # ── HTTP push ─────────────────────────────────────────────────────────────
 
     async def _post(self, payload: dict) -> bool:
         if not self._session or self._session.closed:
@@ -130,15 +140,13 @@ class StatsPush(commands.Cog, name="StatsPush"):
             log.warning("statspush error: %s", e)
         return False
 
-    # ── Push helpers ──────────────────────────────────────────────────────
-
-    async def _push_now(self) -> None:
-        """Build and send a push immediately."""
+    @tasks.loop(seconds=PUSH_INTERVAL)
+    async def push_loop(self) -> None:
         if not _ready():
             return
         try:
             payload = await self._build_payload()
-            ok = await self._post(payload)
+            ok      = await self._post(payload)
             if ok:
                 log.debug(
                     "statspush OK — guilds:%d users:%d calls:%d board:%d",
@@ -146,45 +154,11 @@ class StatsPush(commands.Cog, name="StatsPush"):
                     payload["active_calls"], len(payload["callboard"]),
                 )
         except Exception as e:
-            log.warning("statspush push error: %s", e)
-
-    async def _debounced_push(self) -> None:
-        """
-        Wait MEMBER_PUSH_DELAY seconds then push.
-        If another event fires before the wait ends, the previous task is
-        cancelled and a fresh delay starts — prevents spamming the API
-        when many members join/leave in quick succession (e.g. a raid).
-        """
-        await asyncio.sleep(MEMBER_PUSH_DELAY)
-        await self._push_now()
-
-    def _schedule_push(self) -> None:
-        """Cancel any pending debounced push and schedule a new one."""
-        if self._pending_push and not self._pending_push.done():
-            self._pending_push.cancel()
-        self._pending_push = asyncio.create_task(self._debounced_push())
-
-    # ── Scheduled loop (60s heartbeat) ───────────────────────────────────
-
-    @tasks.loop(seconds=PUSH_INTERVAL)
-    async def push_loop(self) -> None:
-        await self._push_now()
+            log.warning("statspush loop error: %s", e)
 
     @push_loop.before_loop
     async def before_push(self) -> None:
         await self.bot.wait_until_ready()
-
-    # ── Event-driven pushes ───────────────────────────────────────────────
-
-    @commands.Cog.listener()
-    async def on_member_join(self, member: discord.Member) -> None:
-        """Push updated stats when any member joins any server Musubi is in."""
-        self._schedule_push()
-
-    @commands.Cog.listener()
-    async def on_member_remove(self, member: discord.Member) -> None:
-        """Push updated stats when any member leaves any server Musubi is in."""
-        self._schedule_push()
 
 
 async def setup(bot: commands.Bot) -> None:
