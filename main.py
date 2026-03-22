@@ -48,7 +48,8 @@ INITIAL_EXTENSIONS = [
     "cogs.help",
     "cogs.filter",
     "cogs.leaderboard",
-    "cogs.statspush",  
+    "cogs.statspush",
+    "cogs.discordlog",
 ]
 
 
@@ -151,6 +152,49 @@ class Musubi(MusubiBot):
                 except discord.HTTPException as e:
                     log.warning("Welcome fallback failed — guild:%d: %s", guild.id, e)
 
+    async def on_guild_remove(self, guild: discord.Guild) -> None:
+        """
+        Fired when Musubi is kicked, banned, or the server is deleted.
+
+        Design decision — DB row is KEPT, cache is flushed:
+          - XP history, premium, and invite quota are preserved.
+          - If the guild re-adds the bot, /setup works again and their
+            callboard ranking and premium carry over intact.
+          - The in-memory cache is dropped so bridge.py stops trying
+            to relay messages for a guild that's no longer reachable.
+
+        The only thing we actively clean up is open sessions — leaving
+        an active or searching session open would strand the partner
+        guild on the other end of the call with no hangup notification.
+        """
+        gid = str(guild.id)
+
+        # ── End any open session so the partner isn't left hanging ────────
+        try:
+            session = await self.data.get_active_session(gid)
+            if session:
+                from cogs.phone import Phone
+                from typing import cast as _cast
+                phone_cog = _cast(Phone, self.cogs.get("Phone"))
+                if phone_cog:
+                    await phone_cog._notify_end(session, reason="hangup")
+                    await phone_cog._end_session_cleanup(session)
+                await self.data.end_session(session["id"])
+                log.info("on_guild_remove: ended active session %s", session["id"])
+            else:
+                searching = await self.data.get_searching_session(gid)
+                if searching:
+                    await self.data.end_session(searching["id"], status="cancelled")
+                    log.info("on_guild_remove: cancelled searching session %s", searching["id"])
+        except Exception as e:
+            log.warning("on_guild_remove: session cleanup failed guild:%s — %s", gid, e)
+
+        # ── Flush in-memory cache — DB row intentionally preserved ────────
+        self.data.guilds.pop(gid, None)
+        self.data.webhook_cache.pop(gid, None)
+
+        log.info("Guild removed — id:%d name:%r", guild.id, guild.name)
+
     async def on_command_error(self, ctx: commands.Context[BotT], exception: commands.CommandError, /) -> None:
         error = exception
 
@@ -228,13 +272,22 @@ class Musubi(MusubiBot):
 
     async def close(self) -> None:
         log.info("Shutting down.")
+        # Ship a shutdown notice to Discord before the loop dies
+        from cogs.discordlog import DiscordLog
+        from typing import cast as _cast
+        dl = _cast(DiscordLog, self.cogs.get("DiscordLog"))
+        if dl:
+            try:
+                await dl.ship_shutdown()
+            except Exception:
+                pass
         await self.data.close()
         await super().close()
 
 
 def resolve_prefix(bot: Musubi, message: discord.Message) -> list[str]:
     """
-    Prefix resolution order (highest → lowest priority):
+    Prefix resolution order (highest to lowest priority):
       1. @mention  — always works
       2. User personal prefix — premium users, works everywhere including DMs
       3. Guild prefix — server-specific, guild messages only
