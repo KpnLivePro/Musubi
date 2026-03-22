@@ -89,8 +89,9 @@ class Sudo(commands.Cog):
     @commands.group(name="sudo", invoke_without_command=True)
     async def sudo_help(self, ctx: commands.Context[Any]) -> None:
         embed = Embeds.info(
-            "**Groups:** `ban`, `grant`, `key`, `session`, `website`, `reload`\n"
-            "**Commands:** `list`, `add`, `remove`"
+            "**Groups:** `ban`, `grant`, `key`, `session`, `website`, `reload`, `guilds`\n"
+            "**Commands:** `list`, `add`, `remove`\n\n"
+            "> *`guilds` is a top-level group — use `m.guilds list` / `m.guilds info <id>`*"
         )
         await ctx.send(embed=embed, ephemeral=True)
 
@@ -654,5 +655,94 @@ class Sudo(commands.Cog):
         await ctx.send(embed=Embeds.reload_all(lines), ephemeral=True)
 
 
-async def setup(bot: commands.Bot) -> None:
-    await bot.add_cog(Sudo(bot))  # type: ignore[arg-type]
+    # ── m.guilds ──────────────────────────────────────────────────────────────
+
+    @commands.group(name="guilds", invoke_without_command=True)
+    async def guilds_group(self, ctx: commands.Context[Any]) -> None:
+        await ctx.send(
+            embed=Embeds.info("Available subcommands: `list [page]`, `info <guild_id>`"),
+            ephemeral=True,
+        )
+
+    @guilds_group.command(name="list")
+    async def guilds_list(self, ctx: commands.Context[Any], page: int = 1) -> None:
+        """List all registered guilds with IDs, XP, and premium status. 10 per page."""
+        guilds   = list(self.data.guilds.items())  # [(guild_id, data), ...]
+        per_page = 10
+        total    = len(guilds)
+        pages    = max(1, -(-total // per_page))   # ceiling division
+        page     = max(1, min(page, pages))
+        start    = (page - 1) * per_page
+        chunk    = guilds[start:start + per_page]
+
+        if not chunk:
+            await ctx.send(embed=Embeds.info("No guilds are currently registered."), ephemeral=True)
+            return
+
+        lines: list[str] = []
+        for gid, g in chunk:
+            discord_guild = self.bot.get_guild(int(gid))
+            name          = discord_guild.name if discord_guild else f"Unknown `{gid[-4:]}`"
+            xp            = g.get("xp") or 0
+            is_banned     = g.get("is_banned", False)
+            flag          = " `🔨`" if is_banned else ""
+            lines.append(f"> `{gid}` **{name}**{flag} — `{xp:,} XP`")
+
+        embed = discord.Embed(
+            description=(
+                f"> `🏠` *Registered Guilds — Page {page}/{pages} ({total} total)*\n\n"
+                + "\n".join(lines)
+            ),
+            color=0xC084FC,
+        )
+        embed.set_footer(text=f"m.guilds list {page + 1}  —  next page" if page < pages else "Last page")
+        await ctx.send(embed=embed, ephemeral=True)
+
+    @guilds_group.command(name="info")
+    async def guilds_info(self, ctx: commands.Context[Any], guild_id: str) -> None:
+        """Show detailed info for a specific guild ID."""
+        g = self.data.get_guild(guild_id)
+        if not g:
+            await ctx.send(
+                embed=Embeds.error(f"Guild `{guild_id}` is not registered on the network."),
+                ephemeral=True,
+            )
+            return
+
+        discord_guild = self.bot.get_guild(int(guild_id))
+        name          = discord_guild.name if discord_guild else f"Not in cache"
+        members       = discord_guild.member_count if discord_guild else "—"
+        icon          = discord_guild.icon.url if discord_guild and discord_guild.icon else None
+
+        is_premium    = await self.data.is_premium_guild(guild_id)
+        booth         = g.get("booth_channel", "—")
+        xp            = g.get("xp") or 0
+        is_banned     = g.get("is_banned", False)
+        invite_url    = g.get("invite_url")
+        invite_quota  = g.get("invite_quota") or 0
+        prefix        = g.get("prefix") or "`Default (m.)`"
+
+        embed = discord.Embed(
+            description=(
+                f"> `🏠` *Guild Info*\n\n"
+                f"> `🆔` *ID:* `{guild_id}`\n"
+                f"> `📛` *Name:* **{name}**\n"
+                f"> `👥` *Members:* `{members}`\n"
+                f"> `📺` *Booth:* <#{booth}>\n"
+                f"> `🏆` *XP:* `{xp:,}`\n"
+                f"> `✨` *Premium:* `{'Active' if is_premium else 'None'}`\n"
+                f"> `🔨` *Banned:* `{'Yes' if is_banned else 'No'}`\n"
+                f"> `📬` *Invite bank:* `{invite_quota}`\n"
+                f"> `⌨️` *Prefix:* `{prefix}`\n"
+                + (f"> `🔗` *Invite:* {invite_url}" if invite_url else "> `🔗` *Invite:* `Not set`")
+            ),
+            color=0xC084FC,
+        )
+        if icon:
+            embed.set_thumbnail(url=str(icon))
+        embed.set_footer(text=f"Requested by {ctx.author.display_name}")
+        await ctx.send(embed=embed, ephemeral=True)
+
+
+async def setup(bot: MusubiBot) -> None:
+    await bot.add_cog(Sudo(bot))
